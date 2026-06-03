@@ -1,0 +1,19 @@
+# Python venv
+venv/
+
+# Model weights (re-downloadable, large)
+models/
+*.pt
+
+# Video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Outputs (annotated videos + track CSVs)
+output/
+
+# Python caches
+__pycache__/
+*.pyc
