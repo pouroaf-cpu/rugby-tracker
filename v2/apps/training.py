@@ -76,6 +76,35 @@ def _lazy_pose():
     return PoseOverlay()
 
 
+def _draw_badge(frame, track, idx0):
+    """Small top-left cache status badge on a video panel: overall refine % for
+    the clip, plus a dot that's green when THIS frame is cached, amber when not
+    (so you can tell at a glance whether the bit you're looping is ready)."""
+    if track is None:
+        return frame
+    h, w = frame.shape[:2]
+    pct = int(round(track.progress() * 100))
+    done = pct >= 100
+    here = track.has(idx0)
+    label = "Refined" if done else f"Refining {pct}%"
+    s = max(0.5, w / 1100.0)
+    th = max(1, int(round(s * 2)))
+    pad = int(8 * s)
+    dot_r = int(7 * s)
+    (tw, tht), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, s, th)
+    box_w = pad + dot_r * 2 + pad // 2 + tw + pad
+    box_h = max(tht, dot_r * 2) + 2 * pad
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (pad, pad), (pad + box_w, pad + box_h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.45, frame, 0.55, 0, frame)
+    cx, cy = pad + pad + dot_r, pad + box_h // 2
+    cv2.circle(frame, (cx, cy), dot_r, (80, 220, 80) if here else (0, 200, 255), -1, cv2.LINE_AA)
+    cv2.putText(frame, label, (cx + dot_r + pad // 2, cy + tht // 2),
+                cv2.FONT_HERSHEY_SIMPLEX, s, (120, 255, 120) if done else (255, 255, 255),
+                th, cv2.LINE_AA)
+    return frame
+
+
 # ---------------------------------------------------------------------------
 # Refine worker - sweeps whole clips, fills the landmark cache in the background.
 # ---------------------------------------------------------------------------
@@ -586,6 +615,7 @@ class TrainingWidget(QtWidgets.QWidget):
                 if last is not None and abs(idx0 - last[0]) <= _HOLD_FRAMES:
                     arr = last[1]
             frame = draw_skeleton(frame, arr)
+        frame = _draw_badge(frame, self.tracks[slot], idx0)
         return frame
 
     def _render(self, live=True):
