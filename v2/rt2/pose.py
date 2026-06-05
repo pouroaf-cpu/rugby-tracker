@@ -120,6 +120,23 @@ def _dot(frame, p, color, r, border):
     cv2.circle(frame, p, int(r), color, -1, cv2.LINE_AA)
 
 
+_FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+
+def _label(frame, p, text, sc):
+    """A small numbered badge (dark disc + white text) marking a limb's ID. The
+    ID is the SAME in both side-by-side videos, so you can match a limb across the
+    two camera angles."""
+    f = 0.5 * sc
+    th = max(1, int(round(sc)))
+    (tw, thh), _ = cv2.getTextSize(text, _FONT, f, th)
+    cx, cy = int(p[0]), int(p[1])
+    rad = int(max(tw, thh) * 0.6 + 5 * sc)
+    cv2.circle(frame, (cx, cy), rad, C_BORDER, -1, cv2.LINE_AA)
+    cv2.putText(frame, text, (cx - tw // 2, cy + thh // 2), _FONT, f,
+                (255, 255, 255), th, cv2.LINE_AA)
+
+
 def draw_skeleton(frame_bgr, arr, *, leg=13, back=12, arm=10, head=8):
     """Draw the form-focused skeleton from a (N_KP,3) array IN PLACE as thick,
     bright, dark-outlined oriented rectangles. The leg/back/arm/head values are
@@ -142,23 +159,43 @@ def draw_skeleton(frame_bgr, arr, *, leg=13, back=12, arm=10, head=8):
     def P(i):
         return _px(arr, i, w, h)
 
-    # arms first (so legs/back/head draw on top)
-    for a, b in ARM_BONES:
-        if ok(a) and ok(b):
-            _bone(frame_bgr, P(a), P(b), C_ARM, hw_arm, bd)
+    # Build the list of bones to draw. Each carries a DEPTH SCORE = mean endpoint
+    # visibility; we draw low-score (further / self-occluded) first so the nearer,
+    # higher-confidence limb ends up ON TOP - correct for side views. `label` is a
+    # per-limb ID, identical in both videos so limbs marry up across angles.
+    bones = []   # (pa, pb, color, hw, score, label)
 
-    # back: shoulder + pelvis cross-bars, then a FLEXIBLE spine through whatever
-    # bend points are available (C7 -> thoracic -> lumbar -> pelvis), so back
-    # rounding shows. Falls back to a straight mid-shoulder->mid-hip line.
-    mid_sh = mid_hip = None
-    if ok(L_SH) and ok(R_SH):
-        _bone(frame_bgr, P(L_SH), P(R_SH), C_BACK, hw_back, bd)
-        mid_sh = _mid(arr, L_SH, R_SH, w, h)
-    if ok(L_HIP) and ok(R_HIP):
-        _bone(frame_bgr, P(L_HIP), P(R_HIP), C_BACK, hw_back, bd)
-        mid_hip = _mid(arr, L_HIP, R_HIP, w, h)
-    spine = []
-    spine.append(P(SP_C7) if ok(SP_C7) else mid_sh)
+    def add(a, b, color, hw, label=None):
+        if ok(a) and ok(b):
+            bones.append((P(a), P(b), color, hw, (vis[a] + vis[b]) * 0.5, label))
+
+    def add_pt(pa, pb, color, hw, score, label=None):
+        if pa is not None and pb is not None:
+            bones.append((pa, pb, color, hw, score, label))
+
+    # arms (cyan)
+    add(L_SH, L_EL, C_ARM, hw_arm, "7"); add(L_EL, L_WR, C_ARM, hw_arm, "9")
+    add(R_SH, R_EL, C_ARM, hw_arm, "8"); add(R_EL, R_WR, C_ARM, hw_arm, "10")
+    # legs + feet (orange)
+    add(L_HIP, L_KN, C_LEG, hw_leg, "1"); add(L_KN, L_AN, C_LEG, hw_leg, "3")
+    add(R_HIP, R_KN, C_LEG, hw_leg, "2"); add(R_KN, R_AN, C_LEG, hw_leg, "4")
+    add(L_AN, L_TOE, C_LEG, hw_leg, "5"); add(L_AN, L_HEEL, C_LEG, hw_leg)
+    add(L_HEEL, L_TOE, C_LEG, hw_leg)
+    add(R_AN, R_TOE, C_LEG, hw_leg, "6"); add(R_AN, R_HEEL, C_LEG, hw_leg)
+    add(R_HEEL, R_TOE, C_LEG, hw_leg)
+
+    # back (green): shoulder + pelvis cross-bars + a FLEXIBLE spine through
+    # whatever bend points exist (C7 -> thoracic -> lumbar -> pelvis), else a
+    # straight shoulder->hip line.
+    mid_sh = _mid(arr, L_SH, R_SH, w, h) if (ok(L_SH) and ok(R_SH)) else None
+    mid_hip = _mid(arr, L_HIP, R_HIP, w, h) if (ok(L_HIP) and ok(R_HIP)) else None
+    sh_sc = (vis[L_SH] + vis[R_SH]) * 0.5 if (ok(L_SH) and ok(R_SH)) else 0.5
+    hip_sc = (vis[L_HIP] + vis[R_HIP]) * 0.5 if (ok(L_HIP) and ok(R_HIP)) else 0.5
+    if mid_sh:
+        add_pt(P(L_SH), P(R_SH), C_BACK, hw_back, sh_sc)
+    if mid_hip:
+        add_pt(P(L_HIP), P(R_HIP), C_BACK, hw_back, hip_sc)
+    spine = [P(SP_C7) if ok(SP_C7) else mid_sh]
     if ok(SP_THORACIC):
         spine.append(P(SP_THORACIC))
     if ok(SP_LUMBAR):
@@ -166,20 +203,23 @@ def draw_skeleton(frame_bgr, arr, *, leg=13, back=12, arm=10, head=8):
     spine.append(mid_hip)
     spine = [p for p in spine if p is not None]
     for a, b in zip(spine, spine[1:]):
-        _bone(frame_bgr, a, b, C_BACK, hw_back, bd)
+        add_pt(a, b, C_BACK, hw_back, (sh_sc + hip_sc) * 0.5, "S" if a is spine[0] else None)
 
-    # legs + feet (priority - thick orange)
-    for a, b in LEG_BONES:
-        if ok(a) and ok(b):
-            _bone(frame_bgr, P(a), P(b), C_LEG, hw_leg, bd)
-
-    # head: a dedicated marker + neck block (nose, else ear-midpoint).
+    # head marker + neck block (nose, else ear-midpoint)
     head_pt = None
     if ok(NOSE):
         head_pt = P(NOSE)
     elif ok(L_EAR) and ok(R_EAR):
         head_pt = _mid(arr, L_EAR, R_EAR, w, h)
     neck_to = (P(SP_C7) if ok(SP_C7) else mid_sh)
+    head_sc = vis[NOSE] if ok(NOSE) else 0.9
+
+    # DEPTH SORT: draw furthest (lowest confidence) first, nearest last/on top.
+    bones.sort(key=lambda e: e[4])
+    for pa, pb, color, hw, _s, _lab in bones:
+        _bone(frame_bgr, pa, pb, color, hw, bd)
+
+    # head drawn near the top of the stack
     if head_pt:
         if neck_to:
             _bone(frame_bgr, head_pt, neck_to, C_HEAD, hw_head, bd)
@@ -187,10 +227,13 @@ def draw_skeleton(frame_bgr, arr, *, leg=13, back=12, arm=10, head=8):
         cv2.circle(frame_bgr, head_pt, rr + bd, C_BORDER, -1, cv2.LINE_AA)
         cv2.circle(frame_bgr, head_pt, rr, C_HEAD, -1, cv2.LINE_AA)
 
-    # knees + ankles: a contrasting dot for a precise reference point
+    # knees + ankles reference dots, then limb ID badges, on top so they read.
     for i in EMPH_JOINTS:
         if ok(i):
             _dot(frame_bgr, P(i), C_JOINT, max(3, int(sc * 4)), bd)
+    for pa, pb, _c, _hw, _s, label in bones:
+        if label:
+            _label(frame_bgr, ((pa[0] + pb[0]) // 2, (pa[1] + pb[1]) // 2), label, sc)
     return frame_bgr
 
 

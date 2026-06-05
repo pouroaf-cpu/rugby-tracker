@@ -684,7 +684,11 @@ class TrainingWidget(QtWidgets.QWidget):
         if self.show_skel:
             track = self.tracks[slot]
             arr = track.smoothed_at(idx0) if track is not None else None
-            if live and not _good(arr) and self._pose is not None:
+            # Only ever run inference on the UI thread when the cache can't answer
+            # AND no refine is currently busy on the (GPU) model - otherwise the
+            # call queues behind the refine pass and the panel appears to hang.
+            allow_live = not (self._refine and self._refine.isRunning())
+            if live and allow_live and not _good(arr) and self._pose is not None:
                 got = self._pose.landmarks_array(frame)
                 if track is not None and got is not None:
                     track.set(idx0, got)
