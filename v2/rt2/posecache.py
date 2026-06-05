@@ -15,11 +15,14 @@ from __future__ import annotations
 
 import numpy as np
 
+_N_KP = 36          # keypoint slots per frame (33 BlazePose + 3 spine; see rt2.pose)
+
 
 class PoseTrack:
-    def __init__(self, n_frames: int):
+    def __init__(self, n_frames: int, n_kp: int = _N_KP):
         self.n = max(1, int(n_frames))
-        self.data = np.full((self.n, 33, 3), np.nan, dtype=np.float32)
+        self.n_kp = int(n_kp)
+        self.data = np.full((self.n, self.n_kp, 3), np.nan, dtype=np.float32)
         self.done = np.zeros(self.n, dtype=bool)
 
     def set(self, idx: int, arr) -> None:
@@ -54,12 +57,12 @@ class PoseTrack:
         frames = np.arange(lo, hi)[dmask]                   # (k,)
         wdist = (w + 1 - np.abs(frames - idx)).clip(min=1).astype(np.float32)  # (k,)
         vis = np.nan_to_num(block[:, :, 2])                 # (k,33)
-        wt = wdist[:, None] * vis                           # (k,33)
-        wsum = wt.sum(0)                                    # (33,)
-        out = np.zeros((33, 3), np.float32)
+        wt = wdist[:, None] * vis                           # (k, n_kp)
+        wsum = wt.sum(0)                                    # (n_kp,)
+        out = np.zeros((self.n_kp, 3), np.float32)
         good = wsum > 1e-6
         xy = np.nan_to_num(block[:, :, :2]) * wt[:, :, None]
-        xy = xy.sum(0)                                      # (33,2)
+        xy = xy.sum(0)                                      # (n_kp, 2)
         out[good, :2] = xy[good] / wsum[good, None]
         out[:, 2] = vis.mean(0)                             # mean visibility
         out[~good, 2] = 0.0

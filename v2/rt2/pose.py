@@ -45,6 +45,10 @@ L_KN, R_KN = 25, 26
 L_AN, R_AN = 27, 28
 L_HEEL, R_HEEL = 29, 30
 L_TOE, R_TOE = 31, 32
+# Extra spine bend points (populated by SynthPose only; BlazePose leaves them
+# empty and the back falls back to a straight shoulder->hip line).
+SP_C7, SP_THORACIC, SP_LUMBAR = 33, 34, 35
+N_KP = 36                      # 33 BlazePose slots + 3 spine markers
 
 # Bone groups (face landmarks 0..10 and hand landmarks 17..22 are intentionally absent).
 LEG_BONES = [(L_HIP, L_KN), (L_KN, L_AN), (R_HIP, R_KN), (R_KN, R_AN),
@@ -59,18 +63,20 @@ JOINTS = [L_SH, R_SH, L_EL, R_EL, L_WR, R_WR,
           L_HIP, R_HIP, L_KN, R_KN, L_AN, R_AN, L_HEEL, R_HEEL, L_TOE, R_TOE]
 EMPH_JOINTS = {L_KN, R_KN, L_AN, R_AN}     # knees + ankles drawn bigger
 
-# BGR colours
-C_LEG = (0, 215, 255)     # amber  - legs / feet (priority)
-C_BACK = (80, 255, 80)    # green  - spine / back
+# BGR colours - all bright/saturated so every segment pops
+C_LEG = (0, 150, 255)     # orange - legs / feet (priority)
+C_BACK = (0, 255, 0)      # green  - spine / back
 C_HEAD = (255, 0, 255)    # magenta- head / neck (separate read)
-C_ARM = (150, 150, 150)   # grey   - arms (de-emphasised)
-C_JOINT = (0, 0, 255)     # red    - joints
+C_ARM = (255, 255, 0)     # cyan   - arms
+C_JOINT = (0, 0, 255)     # red    - knee/ankle reference dots
+C_BORDER = (15, 15, 15)   # near-black outline so crossing limbs stay distinct
 VIS_MIN = 0.3
 
 
 def to_array(landmarks) -> np.ndarray:
-    """MediaPipe NormalizedLandmark list -> (33,3) array of (x, y, visibility)."""
-    out = np.zeros((33, 3), np.float32)
+    """MediaPipe NormalizedLandmark list -> (N_KP,3) array of (x, y, visibility).
+    BlazePose fills the first 33; spine slots 33-35 stay empty."""
+    out = np.zeros((N_KP, 3), np.float32)
     for i, lm in enumerate(landmarks):
         out[i] = (lm.x, lm.y, lm.visibility if lm.visibility is not None else 1.0)
     return out
@@ -85,10 +91,8 @@ def _mid(arr, i, j, w, h):
             int((arr[i, 1] + arr[j, 1]) * 0.5 * h))
 
 
-def _bone(frame, p1, p2, color, hw):
-    """Draw a limb segment as a thick ORIENTED RECTANGLE (with rounded end caps so
-    bent joints connect cleanly) - the rectangle's direction shows which way the
-    segment is pointing, which a thin line can't convey."""
+def _capsule(frame, p1, p2, color, hw):
+    """A thick oriented rectangle + rounded end caps, all in one colour."""
     dx, dy = p2[0] - p1[0], p2[1] - p1[1]
     L = math.hypot(dx, dy)
     if L >= 1:
@@ -102,20 +106,38 @@ def _bone(frame, p1, p2, color, hw):
     cv2.circle(frame, (int(p2[0]), int(p2[1])), r, color, -1, cv2.LINE_AA)
 
 
-def draw_skeleton(frame_bgr, arr, *, leg=9, back=9, arm=5, head=5):
-    """Draw the form-focused skeleton from a (33,3) array IN PLACE as thick
-    oriented rectangles. The leg/back/arm/head values are half-widths (px at
-    ~1000px wide, auto-scaled to the frame). No-op if arr is None; each element
-    is drawn only when its landmark visibility passes VIS_MIN."""
+def _bone(frame, p1, p2, color, hw, border):
+    """Draw a limb segment as a thick ORIENTED RECTANGLE with a dark OUTLINE.
+    The outline is drawn first at hw+border, the bright fill on top at hw - so
+    when a later bone crosses an earlier one its dark border separates them and
+    you can tell which limb is in front."""
+    _capsule(frame, p1, p2, C_BORDER, hw + border)
+    _capsule(frame, p1, p2, color, hw)
+
+
+def _dot(frame, p, color, r, border):
+    cv2.circle(frame, p, int(r + border), C_BORDER, -1, cv2.LINE_AA)
+    cv2.circle(frame, p, int(r), color, -1, cv2.LINE_AA)
+
+
+def draw_skeleton(frame_bgr, arr, *, leg=13, back=12, arm=10, head=8):
+    """Draw the form-focused skeleton from a (N_KP,3) array IN PLACE as thick,
+    bright, dark-outlined oriented rectangles. The leg/back/arm/head values are
+    half-widths (px at ~1000px wide, auto-scaled to the frame). The back follows
+    real spine bend points (C7/thoracic/lumbar) when present, else a straight
+    shoulder->hip line. No-op if arr is None; each element drawn only when its
+    landmark visibility passes VIS_MIN."""
     if arr is None:
         return frame_bgr
     h, w = frame_bgr.shape[:2]
     vis = arr[:, 2]
+    n = arr.shape[0]
     sc = max(1.0, w / 1000.0)
     hw_leg, hw_arm, hw_back, hw_head = leg * sc, arm * sc, back * sc, head * sc
+    bd = max(2, int(round(sc * 2.5)))      # outline thickness
 
     def ok(i):
-        return vis[i] >= VIS_MIN
+        return i < n and vis[i] >= VIS_MIN
 
     def P(i):
         return _px(arr, i, w, h)
@@ -123,39 +145,52 @@ def draw_skeleton(frame_bgr, arr, *, leg=9, back=9, arm=5, head=5):
     # arms first (so legs/back/head draw on top)
     for a, b in ARM_BONES:
         if ok(a) and ok(b):
-            _bone(frame_bgr, P(a), P(b), C_ARM, hw_arm)
+            _bone(frame_bgr, P(a), P(b), C_ARM, hw_arm, bd)
 
-    # back: shoulders, pelvis, and the central spine block
+    # back: shoulder + pelvis cross-bars, then a FLEXIBLE spine through whatever
+    # bend points are available (C7 -> thoracic -> lumbar -> pelvis), so back
+    # rounding shows. Falls back to a straight mid-shoulder->mid-hip line.
     mid_sh = mid_hip = None
     if ok(L_SH) and ok(R_SH):
-        _bone(frame_bgr, P(L_SH), P(R_SH), C_BACK, hw_back)
+        _bone(frame_bgr, P(L_SH), P(R_SH), C_BACK, hw_back, bd)
         mid_sh = _mid(arr, L_SH, R_SH, w, h)
     if ok(L_HIP) and ok(R_HIP):
-        _bone(frame_bgr, P(L_HIP), P(R_HIP), C_BACK, hw_back)
+        _bone(frame_bgr, P(L_HIP), P(R_HIP), C_BACK, hw_back, bd)
         mid_hip = _mid(arr, L_HIP, R_HIP, w, h)
-    if mid_sh and mid_hip:
-        _bone(frame_bgr, mid_sh, mid_hip, C_BACK, hw_back)
+    spine = []
+    spine.append(P(SP_C7) if ok(SP_C7) else mid_sh)
+    if ok(SP_THORACIC):
+        spine.append(P(SP_THORACIC))
+    if ok(SP_LUMBAR):
+        spine.append(P(SP_LUMBAR))
+    spine.append(mid_hip)
+    spine = [p for p in spine if p is not None]
+    for a, b in zip(spine, spine[1:]):
+        _bone(frame_bgr, a, b, C_BACK, hw_back, bd)
 
-    # legs + feet (priority - thick amber)
+    # legs + feet (priority - thick orange)
     for a, b in LEG_BONES:
         if ok(a) and ok(b):
-            _bone(frame_bgr, P(a), P(b), C_LEG, hw_leg)
+            _bone(frame_bgr, P(a), P(b), C_LEG, hw_leg, bd)
 
-    # head: a dedicated marker + neck block (nose, else ear-midpoint)
+    # head: a dedicated marker + neck block (nose, else ear-midpoint).
     head_pt = None
     if ok(NOSE):
         head_pt = P(NOSE)
     elif ok(L_EAR) and ok(R_EAR):
         head_pt = _mid(arr, L_EAR, R_EAR, w, h)
+    neck_to = (P(SP_C7) if ok(SP_C7) else mid_sh)
     if head_pt:
-        if mid_sh:
-            _bone(frame_bgr, head_pt, mid_sh, C_HEAD, hw_head)
-        cv2.circle(frame_bgr, head_pt, int(hw_head * 2.2), C_HEAD, max(2, int(sc * 2)), cv2.LINE_AA)
+        if neck_to:
+            _bone(frame_bgr, head_pt, neck_to, C_HEAD, hw_head, bd)
+        rr = int(hw_head * 2.2)
+        cv2.circle(frame_bgr, head_pt, rr + bd, C_BORDER, -1, cv2.LINE_AA)
+        cv2.circle(frame_bgr, head_pt, rr, C_HEAD, -1, cv2.LINE_AA)
 
     # knees + ankles: a contrasting dot for a precise reference point
     for i in EMPH_JOINTS:
         if ok(i):
-            cv2.circle(frame_bgr, P(i), max(2, int(sc * 3)), C_JOINT, -1, cv2.LINE_AA)
+            _dot(frame_bgr, P(i), C_JOINT, max(3, int(sc * 4)), bd)
     return frame_bgr
 
 

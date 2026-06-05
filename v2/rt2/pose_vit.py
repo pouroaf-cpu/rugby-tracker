@@ -24,8 +24,9 @@ import cv2
 
 _MODEL_ID = "stanfordmimi/synthpose-vitpose-base-hf"
 
-# SynthPose 52-keypoint index -> our 33-slot BlazePose layout (see rt2.pose).
-# 0-16 are standard COCO; 44/45 big toes, 46/47 calcaneus (heels).
+# SynthPose 52-keypoint index -> our keypoint layout (see rt2.pose).
+# 0-16 COCO; 44/45 big toes, 46/47 calcaneus (heels); 48 C7, 50 T11, 49 L2 spine.
+_N_KP = 36
 _SYNTH_TO_BLAZE = {
     0: 0,                  # nose
     3: 7, 4: 8,            # ears
@@ -37,6 +38,9 @@ _SYNTH_TO_BLAZE = {
     15: 27, 16: 28,        # ankles
     46: 29, 47: 30,        # heels   (l_calc -> L heel, r_calc -> R heel)
     45: 31, 44: 32,        # toes    (l_big_toe -> L foot, r_big_toe -> R foot)
+    48: 33,                # C7        -> spine top
+    50: 34,                # T11       -> spine middle
+    49: 35,                # L2        -> spine lower
 }
 
 
@@ -91,7 +95,7 @@ class ViTPoseOverlay:
         kpts = kpts.cpu().numpy() if hasattr(kpts, "cpu") else np.asarray(kpts)
         scores = scores.cpu().numpy() if hasattr(scores, "cpu") else np.asarray(scores)
 
-        arr = np.zeros((33, 3), np.float32)
+        arr = np.zeros((_N_KP, 3), np.float32)
         for si, bl in _SYNTH_TO_BLAZE.items():
             if si < len(kpts):
                 arr[bl] = (kpts[si][0] / w, kpts[si][1] / h, float(scores[si]))
