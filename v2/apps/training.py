@@ -122,48 +122,74 @@ class RefineWorker(QtCore.QThread):
 
     def run(self):
         from rt2.pose import PoseOverlay
+        # Per-clip state so we can ROUND-ROBIN: both clips refine together instead
+        # of one finishing entirely before the other starts. VIDEO mode = temporal
+        # tracking; each clip keeps its own estimator (own tracker state) and is
+        # still walked in frame order, just interleaved in wall-clock time.
+        states = []
         try:
             total = max(1, sum(t.n for _, t, _ in self.jobs))
-            done = 0
             for path, track, start in self.jobs:
-                reader = VideoReader(path)
-                # VIDEO mode = temporal tracking (steadier through movement). A fresh
-                # estimator per clip so the tracker state resets between clips.
-                # Note: rotating the start point means timestamps aren't globally
-                # monotonic, so reset the estimator at the wrap to stay legal.
-                pose = PoseOverlay(mode="video")
-                last_ts = -1
-                fps = reader.fps or 30.0
-                start = max(0, min(int(start), track.n - 1))
-                try:
-                    for k in range(track.n):
-                        if self._abort:
-                            return
-                        i = (start + k) % track.n
-                        if i == 0 and k != 0:        # wrapped past the end - reset tracker
-                            pose.close()
-                            pose = PoseOverlay(mode="video")
-                            last_ts = -1
-                        if not track.has(i):
-                            fr = reader.frame(i + 1)
-                            if fr is None:
-                                track.set(i, None)
-                            else:
-                                ts = int(i * 1000.0 / fps)
-                                if ts <= last_ts:
-                                    ts = last_ts + 1
-                                last_ts = ts
-                                track.set(i, pose.landmarks_array(fr, ts))
-                        done += 1
-                        if done % 5 == 0:
-                            self.progress.emit(int(100 * done / total))
-                finally:
-                    reader.release()
-                    pose.close()
-            self.progress.emit(100)
-            self.finished_ok.emit()
+                states.append({
+                    "reader": VideoReader(path),
+                    "track": track,
+                    "start": max(0, min(int(start), track.n - 1)),
+                    "pose": PoseOverlay(mode="video"),
+                    "last_ts": -1,
+                    "k": 0,
+                })
+
+            processed = 0
+            while not self._abort:
+                advanced = False
+                for st in states:
+                    if self._abort:
+                        break
+                    track, n = st["track"], st["track"].n
+                    # find this clip's next UNCACHED frame (skip cached ones cheaply)
+                    while st["k"] < n:
+                        i = (st["start"] + st["k"]) % n
+                        wrapped = (i == 0 and st["k"] != 0)
+                        st["k"] += 1
+                        if wrapped:                     # restart tracker at the wrap
+                            st["pose"].close()
+                            st["pose"] = PoseOverlay(mode="video")
+                            st["last_ts"] = -1
+                        if track.has(i):
+                            continue
+                        fr = st["reader"].frame(i + 1)
+                        if fr is None:
+                            track.set(i, None)
+                        else:
+                            fps = st["reader"].fps or 30.0
+                            ts = int(i * 1000.0 / fps)
+                            if ts <= st["last_ts"]:
+                                ts = st["last_ts"] + 1
+                            st["last_ts"] = ts
+                            track.set(i, st["pose"].landmarks_array(fr, ts))
+                        advanced = True
+                        break                           # one frame per clip, then rotate
+                    processed += 1
+                    if processed % 5 == 0:
+                        cached = sum(int(t.done.sum()) for _, t, _ in self.jobs)
+                        self.progress.emit(min(100, int(100 * cached / total)))
+                if not advanced:                        # every clip exhausted
+                    break
+            if not self._abort:
+                self.progress.emit(100)
+                self.finished_ok.emit()
         except Exception:
             pass
+        finally:
+            for st in states:
+                try:
+                    st["reader"].release()
+                except Exception:
+                    pass
+                try:
+                    st["pose"].close()
+                except Exception:
+                    pass
 
 
 # ---------------------------------------------------------------------------
