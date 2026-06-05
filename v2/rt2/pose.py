@@ -192,7 +192,13 @@ def draw_skeleton(frame_bgr, arr, *, leg=13, back=12, arm=10, head=8):
     sh_sc = (vis[L_SH] + vis[R_SH]) * 0.5 if (ok(L_SH) and ok(R_SH)) else 0.5
     hip_sc = (vis[L_HIP] + vis[R_HIP]) * 0.5 if (ok(L_HIP) and ok(R_HIP)) else 0.5
     if mid_sh:
-        add_pt(P(L_SH), P(R_SH), C_BACK, hw_back, sh_sc)
+        # shoulders are not a flat bar - hinge through C7 (neck base) so they arch
+        # up to the neck and each side can tilt/shrug independently.
+        if ok(SP_C7):
+            add_pt(P(L_SH), P(SP_C7), C_BACK, hw_back, sh_sc)
+            add_pt(P(SP_C7), P(R_SH), C_BACK, hw_back, sh_sc)
+        else:
+            add_pt(P(L_SH), P(R_SH), C_BACK, hw_back, sh_sc)
     if mid_hip:
         add_pt(P(L_HIP), P(R_HIP), C_BACK, hw_back, hip_sc)
     spine = [P(SP_C7) if ok(SP_C7) else mid_sh]
