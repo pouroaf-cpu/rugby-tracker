@@ -45,10 +45,13 @@ L_KN, R_KN = 25, 26
 L_AN, R_AN = 27, 28
 L_HEEL, R_HEEL = 29, 30
 L_TOE, R_TOE = 31, 32
-# Extra spine bend points (populated by SynthPose only; BlazePose leaves them
-# empty and the back falls back to a straight shoulder->hip line).
-SP_C7, SP_THORACIC, SP_LUMBAR = 33, 34, 35
-N_KP = 36                      # 33 BlazePose slots + 3 spine markers
+# Extra anatomical markers (populated by SynthPose only; BlazePose leaves them
+# empty and the affected parts fall back to simpler straight-line versions).
+SP_C7, SP_THORACIC, SP_LUMBAR = 33, 34, 35   # spine bend points
+L_CLAV, R_CLAV = 36, 37                       # medial shoulder / clavicle joints
+SACRUM = 38                                   # pelvis centre (PSIS midpoint)
+L_5META, R_5META = 39, 40                     # 5th metatarsal (midfoot)
+N_KP = 42                      # 33 BlazePose + spine/clavicle/sacrum/midfoot
 
 # Bone groups (face landmarks 0..10 and hand landmarks 17..22 are intentionally absent).
 LEG_BONES = [(L_HIP, L_KN), (L_KN, L_AN), (R_HIP, R_KN), (R_KN, R_AN),
@@ -176,13 +179,23 @@ def draw_skeleton(frame_bgr, arr, *, leg=13, back=12, arm=10, head=8):
     # arms (cyan)
     add(L_SH, L_EL, C_ARM, hw_arm, "7"); add(L_EL, L_WR, C_ARM, hw_arm, "9")
     add(R_SH, R_EL, C_ARM, hw_arm, "8"); add(R_EL, R_WR, C_ARM, hw_arm, "10")
-    # legs + feet (orange)
+    # legs (orange): thigh + shin
     add(L_HIP, L_KN, C_LEG, hw_leg, "1"); add(L_KN, L_AN, C_LEG, hw_leg, "3")
     add(R_HIP, R_KN, C_LEG, hw_leg, "2"); add(R_KN, R_AN, C_LEG, hw_leg, "4")
-    add(L_AN, L_TOE, C_LEG, hw_leg, "5"); add(L_AN, L_HEEL, C_LEG, hw_leg)
-    add(L_HEEL, L_TOE, C_LEG, hw_leg)
-    add(R_AN, R_TOE, C_LEG, hw_leg, "6"); add(R_AN, R_HEEL, C_LEG, hw_leg)
-    add(R_HEEL, R_TOE, C_LEG, hw_leg)
+
+    # feet: a 3-bone chain ankle -> heel -> midfoot(5th meta) -> toe so the foot
+    # articulates (heel lift, foot roll). Falls back to ankle->heel/ankle->toe.
+    def foot(an, heel, meta, toe, label):
+        if ok(meta):
+            add(an, heel, C_LEG, hw_leg, label)
+            add(heel, meta, C_LEG, hw_leg)
+            add(meta, toe, C_LEG, hw_leg)
+        else:
+            add(an, toe, C_LEG, hw_leg, label)
+            add(an, heel, C_LEG, hw_leg)
+            add(heel, toe, C_LEG, hw_leg)
+    foot(L_AN, L_HEEL, L_5META, L_TOE, "5")
+    foot(R_AN, R_HEEL, R_5META, R_TOE, "6")
 
     # back (green): shoulder + pelvis cross-bars + a FLEXIBLE spine through
     # whatever bend points exist (C7 -> thoracic -> lumbar -> pelvis), else a
@@ -192,21 +205,33 @@ def draw_skeleton(frame_bgr, arr, *, leg=13, back=12, arm=10, head=8):
     sh_sc = (vis[L_SH] + vis[R_SH]) * 0.5 if (ok(L_SH) and ok(R_SH)) else 0.5
     hip_sc = (vis[L_HIP] + vis[R_HIP]) * 0.5 if (ok(L_HIP) and ok(R_HIP)) else 0.5
     if mid_sh:
-        # shoulders are not a flat bar - hinge through C7 (neck base) so they arch
-        # up to the neck and each side can tilt/shrug independently.
+        # shoulders are not a flat bar - a 4-bend chain shoulder -> clavicle -> C7
+        # -> clavicle -> shoulder so they arch to the neck and each side tilts
+        # independently. Missing markers just drop out of the chain.
+        sh_chain = [L_SH]
+        if ok(L_CLAV):
+            sh_chain.append(L_CLAV)
         if ok(SP_C7):
-            add_pt(P(L_SH), P(SP_C7), C_BACK, hw_back, sh_sc)
-            add_pt(P(SP_C7), P(R_SH), C_BACK, hw_back, sh_sc)
-        else:
-            add_pt(P(L_SH), P(R_SH), C_BACK, hw_back, sh_sc)
+            sh_chain.append(SP_C7)
+        if ok(R_CLAV):
+            sh_chain.append(R_CLAV)
+        sh_chain.append(R_SH)
+        for a, b in zip(sh_chain, sh_chain[1:]):
+            add(a, b, C_BACK, hw_back)
     if mid_hip:
-        add_pt(P(L_HIP), P(R_HIP), C_BACK, hw_back, hip_sc)
+        # pelvis hinges through the sacrum so pelvic tilt shows.
+        if ok(SACRUM):
+            add(L_HIP, SACRUM, C_BACK, hw_back)
+            add(SACRUM, R_HIP, C_BACK, hw_back)
+        else:
+            add_pt(P(L_HIP), P(R_HIP), C_BACK, hw_back, hip_sc)
+    # flexible spine: C7 -> thoracic -> lumbar -> sacrum (pelvis).
     spine = [P(SP_C7) if ok(SP_C7) else mid_sh]
     if ok(SP_THORACIC):
         spine.append(P(SP_THORACIC))
     if ok(SP_LUMBAR):
         spine.append(P(SP_LUMBAR))
-    spine.append(mid_hip)
+    spine.append(P(SACRUM) if ok(SACRUM) else mid_hip)
     spine = [p for p in spine if p is not None]
     for a, b in zip(spine, spine[1:]):
         add_pt(a, b, C_BACK, hw_back, (sh_sc + hip_sc) * 0.5, "S" if a is spine[0] else None)

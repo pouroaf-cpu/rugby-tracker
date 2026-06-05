@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import numpy as np
 
-_N_KP = 36          # keypoint slots per frame (33 BlazePose + 3 spine; see rt2.pose)
+_N_KP = 42          # keypoint slots per frame (see rt2.pose N_KP)
 
 
 class PoseTrack:

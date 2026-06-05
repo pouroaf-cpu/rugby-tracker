@@ -25,12 +25,11 @@ import cv2
 _MODEL_ID = "stanfordmimi/synthpose-vitpose-base-hf"
 
 # SynthPose 52-keypoint index -> our keypoint layout (see rt2.pose).
-# 0-16 COCO; 44/45 big toes, 46/47 calcaneus (heels); 48 C7, 50 T11, 49 L2 spine.
-_N_KP = 36
+_N_KP = 42
 _SYNTH_TO_BLAZE = {
     0: 0,                  # nose
     3: 7, 4: 8,            # ears
-    5: 11, 6: 12,          # shoulders
+    5: 11, 6: 12,          # shoulders (acromion)
     7: 13, 8: 14,          # elbows
     9: 15, 10: 16,         # wrists
     11: 23, 12: 24,        # hips
@@ -41,7 +40,11 @@ _SYNTH_TO_BLAZE = {
     48: 33,                # C7        -> spine top
     50: 34,                # T11       -> spine middle
     49: 35,                # L2        -> spine lower
+    19: 36, 18: 37,        # medial shoulders / clavicle (lshoulder, rshoulder)
+    41: 39, 40: 40,        # 5th metatarsal / midfoot (l_5meta, r_5meta)
 }
+# Sacrum (slot 38) is computed from the PSIS markers (no single SynthPose point).
+_PSIS_L, _PSIS_R, _SACRUM = 31, 30, 38
 
 
 class ViTPoseOverlay:
@@ -99,6 +102,11 @@ class ViTPoseOverlay:
         for si, bl in _SYNTH_TO_BLAZE.items():
             if si < len(kpts):
                 arr[bl] = (kpts[si][0] / w, kpts[si][1] / h, float(scores[si]))
+        # sacrum = midpoint of the two PSIS markers
+        if _PSIS_L < len(kpts) and _PSIS_R < len(kpts):
+            arr[_SACRUM] = ((kpts[_PSIS_L][0] + kpts[_PSIS_R][0]) * 0.5 / w,
+                            (kpts[_PSIS_L][1] + kpts[_PSIS_R][1]) * 0.5 / h,
+                            float(min(scores[_PSIS_L], scores[_PSIS_R])))
         return arr
 
     def close(self):
