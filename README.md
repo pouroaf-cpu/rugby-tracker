@@ -2,6 +2,18 @@
 
 Player detection + tracking for rugby footage on an RTX 3060 (12GB).
 
+## Studio — two modes
+Launch the tabbed studio to choose a mode:
+```powershell
+python v2\apps\studio.py
+```
+- **Game Analyse** — opens the full match player-tracker (`v2/apps/track.py`) in its own window.
+- **Training Analyse** — load two clips (two angles of yourself, or you vs a pro
+  reference), sync them (audio auto-sync + manual offset), draw a BlazePose
+  skeleton on each, play them side by side, and export the annotated side-by-side
+  video to feed into another AI for body-positioning feedback. Built for bodyweight
+  work (squats, lunges, press-ups, sit-ups). Standalone: `python v2\apps\training.py`.
+
 ## Stack
 - **Detector:** YOLOv11m (`yolo11m.pt`), person class only (class 0)
 - **Tracker:** ByteTrack via [BoxMOT](https://github.com/mikel-brostrom/boxmot)
@@ -17,7 +29,17 @@ python -m venv venv
 python -m pip install --upgrade pip
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 pip install ultralytics boxmot supervision opencv-python
+# Training Analyse (pose overlay): BlazePose via MediaPipe Tasks
+pip install mediapipe scipy
 ```
+
+### Training Analyse pose model (one-time download, gitignored)
+The BlazePose **heavy** model (33 landmarks incl. feet — most accurate for ankle/leg
+form) is not bundled. Download it once into `models/`:
+```powershell
+Invoke-WebRequest "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task" -OutFile "models\pose_landmarker_heavy.task"
+```
+Audio auto-sync uses `ffmpeg` (must be on PATH).
 
 ## Re-activate the venv each session
 ```powershell

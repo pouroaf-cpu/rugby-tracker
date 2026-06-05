@@ -17,3 +17,14 @@ output/
 # Python caches
 __pycache__/
 *.pyc
+
+# Internal / agent docs — never publish (README.md is the only public doc)
+STATUS.md
+TASKS.md
+CLAUDE.md
+CODEX*.md
+HANDOFF.md
+FILE_MAP.md
+AGENTS.md
+rugby.md
+docs/
