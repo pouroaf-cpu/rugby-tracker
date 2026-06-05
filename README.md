@@ -29,9 +29,19 @@ python -m venv venv
 python -m pip install --upgrade pip
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 pip install ultralytics boxmot supervision opencv-python
-# Training Analyse (pose overlay): BlazePose via MediaPipe Tasks
+# Training Analyse (pose overlay):
+#   BlazePose (CPU, MediaPipe Tasks) + GPU engine (SynthPose/ViTPose via transformers)
 pip install mediapipe scipy
+pip install "transformers==4.50.3" accelerate   # pinned for torch 2.5 compatibility
 ```
+
+### Training Analyse pose engines
+Two selectable engines (dropdown, top-right of the Training tab):
+- **SynthPose (GPU, feet)** — default when CUDA is present. ViTPose fine-tuned for
+  biomechanics (52 keypoints incl. heel/toe), runs on the GPU via `transformers`;
+  uses YOLO (`yolo11m.pt`) for the person box. Model `stanfordmimi/synthpose-vitpose-base-hf`
+  downloads to the HF cache on first use. Fast (~real-time on an RTX 3060).
+- **BlazePose (CPU, feet)** — MediaPipe heavy model; no GPU, slower first pass.
 
 ### Training Analyse pose model (one-time download, gitignored)
 The BlazePose **heavy** model (33 landmarks incl. feet — most accurate for ankle/leg

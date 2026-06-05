@@ -71,9 +71,23 @@ def _scale_to_height(frame_bgr, h: int):
     return cv2.resize(frame_bgr, (w, h), interpolation=cv2.INTER_AREA)
 
 
-def _lazy_pose():
+def _make_engine(name, mode="image"):
+    """Build a pose engine. 'vit' = SynthPose/ViTPose on GPU (feet, fast).
+    'blaze' = MediaPipe BlazePose on CPU (feet, slow). Both expose
+    landmarks_array(frame, t_ms=None) and close()."""
+    if name == "vit":
+        from rt2.pose_vit import ViTPoseOverlay
+        return ViTPoseOverlay()
     from rt2.pose import PoseOverlay
-    return PoseOverlay()
+    return PoseOverlay(mode=mode)
+
+
+def _gpu_available():
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except Exception:
+        return False
 
 
 def _draw_badge(frame, track, idx0):
@@ -112,29 +126,33 @@ class RefineWorker(QtCore.QThread):
     progress = QtCore.Signal(int)        # 0..100 overall
     finished_ok = QtCore.Signal()
 
-    def __init__(self, jobs, parent=None):
+    def __init__(self, jobs, engine="blaze", parent=None):
         super().__init__(parent)
         self.jobs = jobs                 # list of (path, PoseTrack, start_idx)
+        self.engine = engine
         self._abort = False
 
     def stop(self):
         self._abort = True
 
     def run(self):
-        from rt2.pose import PoseOverlay
-        # Per-clip state so we can ROUND-ROBIN: both clips refine together instead
-        # of one finishing entirely before the other starts. VIDEO mode = temporal
-        # tracking; each clip keeps its own estimator (own tracker state) and is
-        # still walked in frame order, just interleaved in wall-clock time.
+        # ROUND-ROBIN both clips so they refine together (one frame each, rotating).
+        # BlazePose ('blaze') uses VIDEO mode = temporal tracking, so it needs a
+        # SEPARATE estimator per clip and a reset at the rotation wrap. The GPU
+        # engine ('vit') is stateless top-down, so one shared estimator serves all
+        # clips (and loads the model only once).
         states = []
+        shared = None
         try:
             total = max(1, sum(t.n for _, t, _ in self.jobs))
+            if self.engine == "vit":
+                shared = _make_engine("vit")
             for path, track, start in self.jobs:
                 states.append({
                     "reader": VideoReader(path),
                     "track": track,
                     "start": max(0, min(int(start), track.n - 1)),
-                    "pose": PoseOverlay(mode="video"),
+                    "pose": shared if shared is not None else _make_engine("blaze", mode="video"),
                     "last_ts": -1,
                     "k": 0,
                 })
@@ -146,14 +164,13 @@ class RefineWorker(QtCore.QThread):
                     if self._abort:
                         break
                     track, n = st["track"], st["track"].n
-                    # find this clip's next UNCACHED frame (skip cached ones cheaply)
                     while st["k"] < n:
                         i = (st["start"] + st["k"]) % n
                         wrapped = (i == 0 and st["k"] != 0)
                         st["k"] += 1
-                        if wrapped:                     # restart tracker at the wrap
+                        if wrapped and self.engine == "blaze":   # reset temporal tracker
                             st["pose"].close()
-                            st["pose"] = PoseOverlay(mode="video")
+                            st["pose"] = _make_engine("blaze", mode="video")
                             st["last_ts"] = -1
                         if track.has(i):
                             continue
@@ -168,12 +185,12 @@ class RefineWorker(QtCore.QThread):
                             st["last_ts"] = ts
                             track.set(i, st["pose"].landmarks_array(fr, ts))
                         advanced = True
-                        break                           # one frame per clip, then rotate
+                        break
                     processed += 1
                     if processed % 5 == 0:
                         cached = sum(int(t.done.sum()) for _, t, _ in self.jobs)
                         self.progress.emit(min(100, int(100 * cached / total)))
-                if not advanced:                        # every clip exhausted
+                if not advanced:
                     break
             if not self._abort:
                 self.progress.emit(100)
@@ -186,8 +203,14 @@ class RefineWorker(QtCore.QThread):
                     st["reader"].release()
                 except Exception:
                     pass
+                if shared is None:
+                    try:
+                        st["pose"].close()
+                    except Exception:
+                        pass
+            if shared is not None:
                 try:
-                    st["pose"].close()
+                    shared.close()
                 except Exception:
                     pass
 
@@ -201,12 +224,13 @@ class ExportWorker(QtCore.QThread):
     failed = QtCore.Signal(str)
 
     def __init__(self, path_a, path_b, offset, t0, t1, fps_out, out_path,
-                 tracks=None, parent=None):
+                 tracks=None, engine="blaze", parent=None):
         super().__init__(parent)
         self.path_a, self.path_b = path_a, path_b
         self.offset, self.t0, self.t1 = offset, t0, t1
         self.fps_out, self.out_path = fps_out, out_path
         self.tracks = tracks or {A: None, B: None}
+        self.engine = engine
         self._abort = False
 
     def stop(self):
@@ -217,7 +241,7 @@ class ExportWorker(QtCore.QThread):
         try:
             ra = VideoReader(self.path_a)
             rb = VideoReader(self.path_b)
-            pose = _lazy_pose()
+            pose = _make_engine(self.engine)
 
             t = self.t0
             first = self._composite(ra, rb, pose, t)
@@ -292,7 +316,8 @@ class TrainingWidget(QtWidgets.QWidget):
         self.readers: dict[str, VideoReader | None] = {A: None, B: None}
         self.paths: dict[str, str | None] = {A: None, B: None}
         self.tracks: dict[str, PoseTrack | None] = {A: None, B: None}
-        self._pose = None                 # PoseOverlay, lazily created
+        self._pose = None                 # pose engine, lazily created
+        self.engine = "vit" if _gpu_available() else "blaze"   # GPU SynthPose if available
         self.offset = 0.0                 # seconds: b_time = a_time + offset
         self.master_t = 0.0               # current time on A's clock
         self.speed = 1.0
@@ -329,6 +354,16 @@ class TrainingWidget(QtWidgets.QWidget):
         load.addSpacing(16)
         load.addWidget(self.btn_b)
         load.addWidget(self.lbl_b, 1)
+        load.addSpacing(16)
+        load.addWidget(QtWidgets.QLabel("Engine"))
+        self.cmb_engine = QtWidgets.QComboBox()
+        self.cmb_engine.addItem("SynthPose (GPU, feet)", "vit")
+        self.cmb_engine.addItem("BlazePose (CPU, feet)", "blaze")
+        self.cmb_engine.setCurrentIndex(0 if self.engine == "vit" else 1)
+        if not _gpu_available():
+            self.cmb_engine.setItemText(0, "SynthPose (GPU — no CUDA found)")
+        self.cmb_engine.currentIndexChanged.connect(self._on_engine_changed)
+        load.addWidget(self.cmb_engine)
         root.addLayout(load)
 
         # Row 2: sync + refine
@@ -428,7 +463,7 @@ class TrainingWidget(QtWidgets.QWidget):
         if self._pose is None:
             QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
             try:
-                self._pose = _lazy_pose()
+                self._pose = _make_engine(self.engine)
             finally:
                 QtWidgets.QApplication.restoreOverrideCursor()
         return self._pose
@@ -499,6 +534,28 @@ class TrainingWidget(QtWidgets.QWidget):
             self._ensure_pose()
         self._render()
 
+    def _on_engine_changed(self, _idx):
+        name = self.cmb_engine.currentData()
+        if name == self.engine:
+            return
+        self.engine = name
+        # stop refine, drop the old estimator, and clear caches (the new engine's
+        # keypoints replace the old ones), then restart refining from the playhead.
+        if self._refine and self._refine.isRunning():
+            self._refine.stop()
+            self._refine.wait(2000)
+        if self._pose:
+            self._pose.close()
+            self._pose = None
+        for s in (A, B):
+            if self.readers[s]:
+                self.tracks[s] = PoseTrack(self.readers[s].n_frames)
+            self._last[s] = None
+        if self.show_skel:
+            self._ensure_pose()
+        self._render()
+        self._maybe_autorefine()
+
     # -- refine -------------------------------------------------------------
     def _start_refine(self) -> bool:
         jobs = []
@@ -510,7 +567,7 @@ class TrainingWidget(QtWidgets.QWidget):
                 jobs.append((self.paths[s], self.tracks[s], start))
         if not jobs:
             return False
-        self._refine = RefineWorker(jobs, self)
+        self._refine = RefineWorker(jobs, engine=self.engine, parent=self)
         self._refine.progress.connect(self._on_refine_progress)
         self._refine.finished_ok.connect(self._on_refine_done)
         self.btn_refine.setText("Stop refining")
@@ -695,7 +752,8 @@ class TrainingWidget(QtWidgets.QWidget):
         dlg.setMinimumDuration(0)
 
         worker = ExportWorker(self.paths[A], self.paths[B], self.offset,
-                              t0, t1, fps_out, path, dict(self.tracks), self)
+                              t0, t1, fps_out, path, dict(self.tracks),
+                              engine=self.engine, parent=self)
         self._export = worker
         worker.progress.connect(dlg.setValue)
         dlg.canceled.connect(worker.stop)
