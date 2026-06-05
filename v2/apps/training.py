@@ -1,14 +1,21 @@
 """Training Analyse - dual-clip pose-overlay form review.
 
 Load two clips (two angles of yourself, OR yourself vs a professional reference),
-marry them to the same moment, draw a BlazePose skeleton on each, and play them
-side by side. Export the synced, skeleton-annotated side-by-side video to feed
-into another AI for body-positioning feedback.
+marry them to the same moment, draw a form-focused BlazePose skeleton on each,
+and play them side by side. Export the synced, skeleton-annotated side-by-side
+video to feed into another AI for body-positioning feedback.
 
-Sync is "both": an audio cross-correlation auto-aligns clips that share a sound
-(two angles of the same take), and a manual offset slider fine-tunes it - the
-manual path also covers you-vs-pro, where the clips share no audio. Clips at
-different frame rates are aligned on real time (seconds), not frame number.
+Sync is "both": an audio cross-correlation auto-aligns clips that share a sound,
+and a manual offset slider fine-tunes it (and covers you-vs-pro, which shares no
+audio). Different frame rates are aligned on real time (seconds), not frame number.
+
+REFINE: a background pass sweeps the whole clip, caches every frame's landmarks
+and temporally smooths them (rt2.posecache). The overlay gets steadier and replay
+gets faster the more of the clip is cached - "leave it running and it gets clearer".
+
+The overlay is form-focused (rt2.pose): legs/feet (amber) and back/spine (green)
+are emphasised, head has its own marker + neck line (magenta), arms are dimmed,
+and fingers/face are omitted.
 
 Runs embedded in studio.py's "Training Analyse" tab, or standalone:
     python v2/apps/training.py
@@ -28,15 +35,23 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from rt2.video import VideoReader
 from rt2.paths import ProjectPaths
 from rt2 import sync as audiosync
+from rt2.pose import draw_skeleton
+from rt2.posecache import PoseTrack
 
 A, B = "A", "B"
 _SPEEDS = [0.25, 0.5, 1.0, 2.0]
+_HOLD_FRAMES = 8         # keep the last good pose for up to N frames over a dropout
+_MIN_VIS = 0.3
+_MIN_JOINTS = 6          # an array needs this many visible joints to count as a real pose
+
+
+def _good(arr) -> bool:
+    return arr is not None and int((arr[:, 2] >= _MIN_VIS).sum()) >= _MIN_JOINTS
 _EXPORT_H = 720          # each view scaled to this height in the export
 _GAP = 8                 # black gap between the two views (px)
 
 
 def _bgr_to_qpixmap(frame_bgr, target_size: QtCore.QSize) -> QtGui.QPixmap:
-    """Convert a BGR frame to a QPixmap scaled to fit target_size (keep aspect)."""
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     h, w, _ = rgb.shape
     img = QtGui.QImage(rgb.data, w, h, 3 * w, QtGui.QImage.Format_RGB888).copy()
@@ -56,29 +71,69 @@ def _scale_to_height(frame_bgr, h: int):
 
 
 def _lazy_pose():
-    """Import + construct the pose estimator lazily (loading the heavy model
-    takes a moment, and we don't want to pay it until a clip is loaded)."""
     from rt2.pose import PoseOverlay
     return PoseOverlay()
+
+
+# ---------------------------------------------------------------------------
+# Refine worker - sweeps whole clips, fills the landmark cache in the background.
+# ---------------------------------------------------------------------------
+class RefineWorker(QtCore.QThread):
+    progress = QtCore.Signal(int)        # 0..100 overall
+    finished_ok = QtCore.Signal()
+
+    def __init__(self, jobs, parent=None):
+        super().__init__(parent)
+        self.jobs = jobs                 # list of (path, PoseTrack)
+        self._abort = False
+
+    def stop(self):
+        self._abort = True
+
+    def run(self):
+        pose = None
+        try:
+            pose = _lazy_pose()          # own estimator for this thread
+            total = max(1, sum(t.n for _, t in self.jobs))
+            done = 0
+            for path, track in self.jobs:
+                reader = VideoReader(path)
+                try:
+                    for i in range(track.n):
+                        if self._abort:
+                            return
+                        if not track.has(i):
+                            fr = reader.frame(i + 1)
+                            track.set(i, pose.landmarks_array(fr) if fr is not None else None)
+                        done += 1
+                        if done % 5 == 0:
+                            self.progress.emit(int(100 * done / total))
+                finally:
+                    reader.release()
+            self.progress.emit(100)
+            self.finished_ok.emit()
+        except Exception:
+            pass
+        finally:
+            if pose:
+                pose.close()
 
 
 # ---------------------------------------------------------------------------
 # Export worker - renders the side-by-side annotated video off the UI thread.
 # ---------------------------------------------------------------------------
 class ExportWorker(QtCore.QThread):
-    progress = QtCore.Signal(int)        # 0..100
-    finished_ok = QtCore.Signal(str)     # output path
-    failed = QtCore.Signal(str)          # error message
+    progress = QtCore.Signal(int)
+    finished_ok = QtCore.Signal(str)
+    failed = QtCore.Signal(str)
 
-    def __init__(self, path_a, path_b, offset, t0, t1, fps_out, out_path, parent=None):
+    def __init__(self, path_a, path_b, offset, t0, t1, fps_out, out_path,
+                 tracks=None, parent=None):
         super().__init__(parent)
-        self.path_a = path_a
-        self.path_b = path_b
-        self.offset = offset
-        self.t0 = t0
-        self.t1 = t1
-        self.fps_out = fps_out
-        self.out_path = out_path
+        self.path_a, self.path_b = path_a, path_b
+        self.offset, self.t0, self.t1 = offset, t0, t1
+        self.fps_out, self.out_path = fps_out, out_path
+        self.tracks = tracks or {A: None, B: None}
         self._abort = False
 
     def stop(self):
@@ -89,17 +144,16 @@ class ExportWorker(QtCore.QThread):
         try:
             ra = VideoReader(self.path_a)
             rb = VideoReader(self.path_b)
-            pose = _lazy_pose()           # fresh estimator inside the worker thread
+            pose = _lazy_pose()
 
-            # Probe the output frame size from the first composite.
             t = self.t0
             first = self._composite(ra, rb, pose, t)
             if first is None:
                 self.failed.emit("Could not read frames at the start of the overlap.")
                 return
             H, W = first.shape[:2]
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(self.out_path, fourcc, self.fps_out, (W, H))
+            writer = cv2.VideoWriter(self.out_path, cv2.VideoWriter_fourcc(*"mp4v"),
+                                     self.fps_out, (W, H))
             if not writer.isOpened():
                 self.failed.emit("Could not open the output video for writing.")
                 return
@@ -121,7 +175,7 @@ class ExportWorker(QtCore.QThread):
                 self.failed.emit("Export cancelled.")
                 return
             self.finished_ok.emit(self.out_path)
-        except Exception as e:                       # pragma: no cover - surfaced in UI
+        except Exception as e:                       # pragma: no cover
             self.failed.emit(f"{type(e).__name__}: {e}")
         finally:
             for r in (ra, rb):
@@ -135,13 +189,21 @@ class ExportWorker(QtCore.QThread):
             if pose:
                 pose.close()
 
+    def _view(self, reader, pose, track, t):
+        fr = reader.frame(int(round(t * reader.fps)) + 1)
+        if fr is None:
+            return None
+        idx0 = int(round(t * reader.fps))
+        arr = track.smoothed_at(idx0) if track is not None else None
+        if arr is None:
+            arr = pose.landmarks_array(fr)
+        return draw_skeleton(fr, arr)
+
     def _composite(self, ra, rb, pose, t):
-        fa = ra.frame(int(round(t * ra.fps)) + 1)
-        fb = rb.frame(int(round((t + self.offset) * rb.fps)) + 1)
+        fa = self._view(ra, pose, self.tracks.get(A), t)
+        fb = self._view(rb, pose, self.tracks.get(B), t + self.offset)
         if fa is None or fb is None:
             return None
-        fa = pose.draw(fa, pose.landmarks(fa))
-        fb = pose.draw(fb, pose.landmarks(fb))
         fa = _scale_to_height(fa, _EXPORT_H)
         fb = _scale_to_height(fb, _EXPORT_H)
         gap = np.zeros((_EXPORT_H, _GAP, 3), np.uint8)
@@ -156,20 +218,22 @@ class TrainingWidget(QtWidgets.QWidget):
         super().__init__(parent)
         self.readers: dict[str, VideoReader | None] = {A: None, B: None}
         self.paths: dict[str, str | None] = {A: None, B: None}
+        self.tracks: dict[str, PoseTrack | None] = {A: None, B: None}
         self._pose = None                 # PoseOverlay, lazily created
         self.offset = 0.0                 # seconds: b_time = a_time + offset
         self.master_t = 0.0               # current time on A's clock
         self.speed = 1.0
         self.show_skel = True
         self.loop = False
-        self.loop_in: float | None = None    # times on A's clock; None => overlap edge
+        self.loop_in: float | None = None
         self.loop_out: float | None = None
         self._export = None
+        self._refine = None
+        self._last: dict[str, tuple] = {A: None, B: None}   # (idx, arr) carry-forward over dropouts
 
         self._build_ui()
-
         self.timer = QtCore.QTimer(self)
-        self.timer.setInterval(33)        # ~30 fps UI tick
+        self.timer.setInterval(33)
         self.timer.timeout.connect(self._on_tick)
 
     # -- UI -----------------------------------------------------------------
@@ -193,7 +257,7 @@ class TrainingWidget(QtWidgets.QWidget):
         load.addWidget(self.lbl_b, 1)
         root.addLayout(load)
 
-        # Row 2: sync
+        # Row 2: sync + refine
         sync = QtWidgets.QHBoxLayout()
         self.btn_autosync = QtWidgets.QPushButton("Auto-sync (audio)")
         self.btn_autosync.clicked.connect(self._auto_sync)
@@ -208,6 +272,12 @@ class TrainingWidget(QtWidgets.QWidget):
         self.lbl_sync = QtWidgets.QLabel("")
         self.lbl_sync.setStyleSheet("color:#888")
         sync.addWidget(self.lbl_sync, 1)
+        self.btn_refine = QtWidgets.QPushButton("Refine (sharpen over time)")
+        self.btn_refine.setToolTip(
+            "Process the whole clip in the background and temporally smooth the "
+            "skeleton. The overlay gets steadier and playback faster as it fills.")
+        self.btn_refine.clicked.connect(self._toggle_refine)
+        sync.addWidget(self.btn_refine)
         root.addLayout(sync)
 
         # Row 3: side-by-side views
@@ -250,7 +320,6 @@ class TrainingWidget(QtWidgets.QWidget):
         self.chk_skel.setChecked(True)
         self.chk_skel.toggled.connect(self._on_skel_toggled)
         trans.addWidget(self.chk_skel)
-        # Loop a single rep (useful for you-vs-pro: trim each to one rep and repeat).
         self.btn_in = QtWidgets.QPushButton("Set In")
         self.btn_out = QtWidgets.QPushButton("Set Out")
         self.chk_loop = QtWidgets.QCheckBox("Loop")
@@ -269,7 +338,8 @@ class TrainingWidget(QtWidgets.QWidget):
         self.btn_export.clicked.connect(self._export_video)
         exp.addWidget(self.btn_export)
         self.lbl_export = QtWidgets.QLabel(
-            "Skeleton preview runs slow-mo on CPU; export renders at full quality (silent).")
+            "Tip: hit Refine and let it run - the skeleton sharpens and playback speeds up. "
+            "Export renders full quality (silent).")
         self.lbl_export.setStyleSheet("color:#888")
         exp.addWidget(self.lbl_export, 1)
         root.addLayout(exp)
@@ -285,8 +355,6 @@ class TrainingWidget(QtWidgets.QWidget):
         return self._pose
 
     def _overlap(self):
-        """(t0, t1) on A's clock where both clips have footage. If only one is
-        loaded, the range is that single clip."""
         ra, rb = self.readers[A], self.readers[B]
         if ra and rb:
             t0 = max(0.0, -self.offset)
@@ -310,11 +378,11 @@ class TrainingWidget(QtWidgets.QWidget):
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Load failed", str(e))
             return
-        old = self.readers[slot]
-        if old:
-            old.release()
+        if self.readers[slot]:
+            self.readers[slot].release()
         self.readers[slot] = reader
         self.paths[slot] = path
+        self.tracks[slot] = PoseTrack(reader.n_frames)
         lbl = self.lbl_a if slot == A else self.lbl_b
         lbl.setText(f"{pathlib.Path(path).name}  "
                     f"({reader.width}x{reader.height}, {reader.fps:.1f}fps, "
@@ -336,7 +404,7 @@ class TrainingWidget(QtWidgets.QWidget):
         if off is None:
             self.lbl_sync.setText("No shared audio found - set the offset manually.")
             return
-        self.spin_offset.setValue(round(off, 2))   # triggers _on_offset_changed
+        self.spin_offset.setValue(round(off, 2))
         self.lbl_sync.setText(f"Audio-synced: B offset {off:+.2f}s")
 
     def _on_offset_changed(self, val):
@@ -351,16 +419,41 @@ class TrainingWidget(QtWidgets.QWidget):
             self._ensure_pose()
         self._render()
 
+    # -- refine -------------------------------------------------------------
+    def _toggle_refine(self):
+        if self._refine and self._refine.isRunning():
+            self._refine.stop()
+            self.btn_refine.setText("Refine (sharpen over time)")
+            return
+        jobs = [(self.paths[s], self.tracks[s])
+                for s in (A, B) if self.paths[s] and self.tracks[s]]
+        if not jobs:
+            self.lbl_sync.setText("Load a clip before refining.")
+            return
+        self._refine = RefineWorker(jobs, self)
+        self._refine.progress.connect(self._on_refine_progress)
+        self._refine.finished_ok.connect(self._on_refine_done)
+        self.btn_refine.setText("Stop refining")
+        self._refine.start()
+
+    def _on_refine_progress(self, pct):
+        self.lbl_sync.setText(f"Refining… {pct}%  (skeleton sharpens as it fills)")
+        if not self.timer.isActive():     # keep the current frame updating as cache grows
+            self._render()
+
+    def _on_refine_done(self):
+        self.btn_refine.setText("Refine (sharpen over time)")
+        self.lbl_sync.setText("Refined ✓ — overlay smoothed, playback now fast.")
+        self._render()
+
+    # -- loop ---------------------------------------------------------------
     def _loop_bounds(self):
-        """The active loop region on A's clock, defaulting to the full overlap."""
         t0, t1 = self._overlap()
         lo = self.loop_in if self.loop_in is not None else t0
         hi = self.loop_out if self.loop_out is not None else t1
         lo = min(max(lo, t0), t1)
         hi = min(max(hi, t0), t1)
-        if hi <= lo:
-            return t0, t1
-        return lo, hi
+        return (t0, t1) if hi <= lo else (lo, hi)
 
     def _set_in(self):
         self.loop_in = self.master_t
@@ -399,7 +492,7 @@ class TrainingWidget(QtWidgets.QWidget):
         if self.loop:
             lo, hi = self._loop_bounds()
             if self.master_t >= hi:
-                self.master_t = lo            # wrap back to the rep start
+                self.master_t = lo
         else:
             _, t1 = self._overlap()
             if self.master_t >= t1:
@@ -421,12 +514,27 @@ class TrainingWidget(QtWidgets.QWidget):
         t = t_on_a if slot == A else (t_on_a + self.offset)
         if t < 0 or t > reader.duration_s():
             return None
-        frame = reader.frame(int(round(t * reader.fps)) + 1)
+        idx0 = int(round(t * reader.fps))
+        frame = reader.frame(idx0 + 1)
         if frame is None:
             return None
-        if self.show_skel and self._pose is not None:
-            pose = self._pose
-            frame = pose.draw(frame, pose.landmarks(frame))
+        if self.show_skel:
+            track = self.tracks[slot]
+            arr = track.smoothed_at(idx0) if track is not None else None
+            if not _good(arr) and self._pose is not None:
+                live = self._pose.landmarks_array(frame)
+                if track is not None and live is not None:
+                    track.set(idx0, live)
+                if _good(live):
+                    arr = live
+            # carry the last good pose over a brief dropout so it doesn't flicker
+            if _good(arr):
+                self._last[slot] = (idx0, arr)
+            else:
+                last = self._last[slot]
+                if last is not None and abs(idx0 - last[0]) <= _HOLD_FRAMES:
+                    arr = last[1]
+            frame = draw_skeleton(frame, arr)
         return frame
 
     def _render(self):
@@ -437,7 +545,6 @@ class TrainingWidget(QtWidgets.QWidget):
                     view.setText(f"Clip {slot}\n(load a video)")
                 continue
             view.setPixmap(_bgr_to_qpixmap(frame, view.size()))
-
         t0, t1 = self._overlap()
         span = max(1e-6, t1 - t0)
         self.scrub.blockSignals(True)
@@ -452,8 +559,7 @@ class TrainingWidget(QtWidgets.QWidget):
     # -- export -------------------------------------------------------------
     def _export_video(self):
         if not (self.readers[A] and self.readers[B]):
-            QtWidgets.QMessageBox.information(
-                self, "Export", "Load both clips before exporting.")
+            QtWidgets.QMessageBox.information(self, "Export", "Load both clips before exporting.")
             return
         t0, t1 = self._overlap()
         if t1 - t0 < 0.1:
@@ -468,17 +574,15 @@ class TrainingWidget(QtWidgets.QWidget):
             self, "Export side-by-side video", default, "MP4 video (*.mp4)")
         if not path:
             return
-        fps_out = min(self.readers[A].fps, self.readers[B].fps)
-        fps_out = max(10.0, min(60.0, fps_out))
+        fps_out = max(10.0, min(60.0, min(self.readers[A].fps, self.readers[B].fps)))
 
         self.btn_export.setEnabled(False)
-        dlg = QtWidgets.QProgressDialog(
-            "Rendering side-by-side video…", "Cancel", 0, 100, self)
+        dlg = QtWidgets.QProgressDialog("Rendering side-by-side video…", "Cancel", 0, 100, self)
         dlg.setWindowModality(QtCore.Qt.WindowModal)
         dlg.setMinimumDuration(0)
 
         worker = ExportWorker(self.paths[A], self.paths[B], self.offset,
-                              t0, t1, fps_out, path, self)
+                              t0, t1, fps_out, path, dict(self.tracks), self)
         self._export = worker
         worker.progress.connect(dlg.setValue)
         dlg.canceled.connect(worker.stop)
@@ -500,9 +604,10 @@ class TrainingWidget(QtWidgets.QWidget):
     def shutdown(self):
         if self.timer.isActive():
             self.timer.stop()
-        if self._export and self._export.isRunning():
-            self._export.stop()
-            self._export.wait(2000)
+        for w in (self._refine, self._export):
+            if w and w.isRunning():
+                w.stop()
+                w.wait(2000)
         for r in self.readers.values():
             if r:
                 r.release()
