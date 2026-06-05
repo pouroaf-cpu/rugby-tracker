@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import pathlib
 import sys
+import time
 
 # v2 on path so `from rt2.x import ...` works whether run standalone or embedded.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
@@ -91,32 +92,41 @@ class RefineWorker(QtCore.QThread):
         self._abort = True
 
     def run(self):
-        pose = None
+        from rt2.pose import PoseOverlay
         try:
-            pose = _lazy_pose()          # own estimator for this thread
             total = max(1, sum(t.n for _, t in self.jobs))
             done = 0
             for path, track in self.jobs:
                 reader = VideoReader(path)
+                # VIDEO mode = temporal tracking (steadier through movement). A fresh
+                # estimator per clip so the tracker state resets between clips.
+                pose = PoseOverlay(mode="video")
+                last_ts = -1
+                fps = reader.fps or 30.0
                 try:
                     for i in range(track.n):
                         if self._abort:
                             return
                         if not track.has(i):
                             fr = reader.frame(i + 1)
-                            track.set(i, pose.landmarks_array(fr) if fr is not None else None)
+                            if fr is None:
+                                track.set(i, None)
+                            else:
+                                ts = int(i * 1000.0 / fps)
+                                if ts <= last_ts:
+                                    ts = last_ts + 1
+                                last_ts = ts
+                                track.set(i, pose.landmarks_array(fr, ts))
                         done += 1
                         if done % 5 == 0:
                             self.progress.emit(int(100 * done / total))
                 finally:
                     reader.release()
+                    pose.close()
             self.progress.emit(100)
             self.finished_ok.emit()
         except Exception:
             pass
-        finally:
-            if pose:
-                pose.close()
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +240,7 @@ class TrainingWidget(QtWidgets.QWidget):
         self._export = None
         self._refine = None
         self._last: dict[str, tuple] = {A: None, B: None}   # (idx, arr) carry-forward over dropouts
+        self._fps_ema: float | None = None                  # smoothed render-rate readout
 
         self._build_ui()
         self.timer = QtCore.QTimer(self)
@@ -308,6 +319,11 @@ class TrainingWidget(QtWidgets.QWidget):
         trans.addWidget(self.scrub, 1)
         self.lbl_time = QtWidgets.QLabel("0.00 / 0.00 s")
         trans.addWidget(self.lbl_time)
+        self.lbl_fps = QtWidgets.QLabel("—")
+        self.lbl_fps.setToolTip("Live render rate. Slow while running the model; "
+                                "jumps up once frames are cached (Refine).")
+        self.lbl_fps.setStyleSheet("color:#888")
+        trans.addWidget(self.lbl_fps)
         trans.addWidget(QtWidgets.QLabel("Speed"))
         self.cmb_speed = QtWidgets.QComboBox()
         for s in _SPEEDS:
@@ -390,6 +406,7 @@ class TrainingWidget(QtWidgets.QWidget):
         lbl.setStyleSheet("color:#ddd")
         self.master_t, _ = self._overlap()
         self._render()
+        self._maybe_autorefine()      # start filling the cache so playback smooths out
 
     def _auto_sync(self):
         if not (self.paths[A] and self.paths[B]):
@@ -420,21 +437,34 @@ class TrainingWidget(QtWidgets.QWidget):
         self._render()
 
     # -- refine -------------------------------------------------------------
-    def _toggle_refine(self):
-        if self._refine and self._refine.isRunning():
-            self._refine.stop()
-            self.btn_refine.setText("Refine (sharpen over time)")
-            return
+    def _start_refine(self) -> bool:
         jobs = [(self.paths[s], self.tracks[s])
                 for s in (A, B) if self.paths[s] and self.tracks[s]]
         if not jobs:
-            self.lbl_sync.setText("Load a clip before refining.")
-            return
+            return False
         self._refine = RefineWorker(jobs, self)
         self._refine.progress.connect(self._on_refine_progress)
         self._refine.finished_ok.connect(self._on_refine_done)
         self.btn_refine.setText("Stop refining")
         self._refine.start()
+        return True
+
+    def _toggle_refine(self):
+        if self._refine and self._refine.isRunning():
+            self._refine.stop()
+            self.btn_refine.setText("Refine (sharpen over time)")
+            return
+        if not self._start_refine():
+            self.lbl_sync.setText("Load a clip before refining.")
+
+    def _maybe_autorefine(self):
+        """Auto-fill the cache in the background after a clip loads, so playback
+        smooths out on its own. Restart to include any newly loaded clip - already
+        cached frames are skipped, so no work is lost."""
+        if self._refine and self._refine.isRunning():
+            self._refine.stop()
+            self._refine.wait(1500)
+        self._start_refine()
 
     def _on_refine_progress(self, pct):
         self.lbl_sync.setText(f"Refining… {pct}%  (skeleton sharpens as it fills)")
@@ -538,6 +568,7 @@ class TrainingWidget(QtWidgets.QWidget):
         return frame
 
     def _render(self):
+        _t = time.perf_counter()
         for slot, view in ((A, self.view_a), (B, self.view_b)):
             frame = self._frame_for(slot, self.master_t)
             if frame is None:
@@ -545,6 +576,11 @@ class TrainingWidget(QtWidgets.QWidget):
                     view.setText(f"Clip {slot}\n(load a video)")
                 continue
             view.setPixmap(_bgr_to_qpixmap(frame, view.size()))
+        dt = time.perf_counter() - _t
+        if dt > 0:
+            inst = 1.0 / dt
+            self._fps_ema = inst if self._fps_ema is None else 0.7 * self._fps_ema + 0.3 * inst
+            self.lbl_fps.setText(f"~{min(self._fps_ema, 30):.0f} fps")
         t0, t1 = self._overlap()
         span = max(1e-6, t1 - t0)
         self.scrub.blockSignals(True)

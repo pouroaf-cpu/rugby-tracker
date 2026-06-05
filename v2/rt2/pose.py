@@ -144,7 +144,12 @@ class PoseOverlay:
     frames from several clips in any order. NOT thread-safe - use a separate
     instance per thread (e.g. the refine worker creates its own)."""
 
-    def __init__(self, model_path: Path | str = DEFAULT_MODEL, min_conf: float = 0.3):
+    def __init__(self, model_path: Path | str = DEFAULT_MODEL, min_conf: float = 0.3,
+                 mode: str = "image"):
+        """mode="image": stateless per-frame, safe for random-access scrubbing.
+        mode="video": temporal tracking - each frame is guided by the previous
+        one, far steadier THROUGH MOVEMENT, but requires strictly increasing
+        timestamps (so only use it on a sequential forward pass, e.g. Refine)."""
         model_path = Path(model_path)
         if not model_path.exists():
             raise FileNotFoundError(
@@ -154,9 +159,11 @@ class PoseOverlay:
                 "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
                 "pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task "
                 f"-OutFile '{model_path}'")
+        self.mode = mode
+        rm = _vision.RunningMode.VIDEO if mode == "video" else _vision.RunningMode.IMAGE
         opts = _vision.PoseLandmarkerOptions(
             base_options=_mpp.BaseOptions(model_asset_path=str(model_path)),
-            running_mode=_vision.RunningMode.IMAGE,
+            running_mode=rm,
             num_poses=1,
             min_pose_detection_confidence=min_conf,
             min_pose_presence_confidence=min_conf,
@@ -164,12 +171,16 @@ class PoseOverlay:
         )
         self._lm = _vision.PoseLandmarker.create_from_options(opts)
 
-    def landmarks_array(self, frame_bgr) -> "np.ndarray | None":
+    def landmarks_array(self, frame_bgr, t_ms: "int | None" = None) -> "np.ndarray | None":
         """Return a (33,3) array of (x, y, visibility) for the most prominent
-        person, or None if no pose is found."""
+        person, or None if no pose is found. In video mode pass a monotonically
+        increasing t_ms."""
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        res = self._lm.detect(image)
+        if self.mode == "video":
+            res = self._lm.detect_for_video(image, int(t_ms if t_ms is not None else 0))
+        else:
+            res = self._lm.detect(image)
         if not res.pose_landmarks:
             return None
         return to_array(res.pose_landmarks[0])
