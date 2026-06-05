@@ -23,6 +23,7 @@ Model file: models/pose_landmarker_heavy.task (downloaded once, gitignored).
 """
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import cv2
@@ -84,58 +85,77 @@ def _mid(arr, i, j, w, h):
             int((arr[i, 1] + arr[j, 1]) * 0.5 * h))
 
 
-def draw_skeleton(frame_bgr, arr, *, leg=4, back=3, arm=2, head=3):
-    """Draw the form-focused skeleton from a (33,3) array IN PLACE. No-op if
-    arr is None. Each element is only drawn when its landmark visibility passes
-    VIS_MIN so low-confidence guesses don't clutter the view."""
+def _bone(frame, p1, p2, color, hw):
+    """Draw a limb segment as a thick ORIENTED RECTANGLE (with rounded end caps so
+    bent joints connect cleanly) - the rectangle's direction shows which way the
+    segment is pointing, which a thin line can't convey."""
+    dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+    L = math.hypot(dx, dy)
+    if L >= 1:
+        ux, uy = dx / L, dy / L
+        nx, ny = -uy * hw, ux * hw          # perpendicular, length = half-width
+        quad = np.array([[p1[0] + nx, p1[1] + ny], [p2[0] + nx, p2[1] + ny],
+                         [p2[0] - nx, p2[1] - ny], [p1[0] - nx, p1[1] - ny]], np.int32)
+        cv2.fillConvexPoly(frame, quad, color, cv2.LINE_AA)
+    r = max(1, int(round(hw)))
+    cv2.circle(frame, (int(p1[0]), int(p1[1])), r, color, -1, cv2.LINE_AA)
+    cv2.circle(frame, (int(p2[0]), int(p2[1])), r, color, -1, cv2.LINE_AA)
+
+
+def draw_skeleton(frame_bgr, arr, *, leg=9, back=9, arm=5, head=5):
+    """Draw the form-focused skeleton from a (33,3) array IN PLACE as thick
+    oriented rectangles. The leg/back/arm/head values are half-widths (px at
+    ~1000px wide, auto-scaled to the frame). No-op if arr is None; each element
+    is drawn only when its landmark visibility passes VIS_MIN."""
     if arr is None:
         return frame_bgr
     h, w = frame_bgr.shape[:2]
     vis = arr[:, 2]
+    sc = max(1.0, w / 1000.0)
+    hw_leg, hw_arm, hw_back, hw_head = leg * sc, arm * sc, back * sc, head * sc
 
     def ok(i):
         return vis[i] >= VIS_MIN
 
+    def P(i):
+        return _px(arr, i, w, h)
+
     # arms first (so legs/back/head draw on top)
     for a, b in ARM_BONES:
         if ok(a) and ok(b):
-            cv2.line(frame_bgr, _px(arr, a, w, h), _px(arr, b, w, h), C_ARM, arm, cv2.LINE_AA)
+            _bone(frame_bgr, P(a), P(b), C_ARM, hw_arm)
 
-    # back: shoulders, pelvis, and the central spine line
-    if ok(L_SH) and ok(R_SH):
-        cv2.line(frame_bgr, _px(arr, L_SH, w, h), _px(arr, R_SH, w, h), C_BACK, back, cv2.LINE_AA)
-    if ok(L_HIP) and ok(R_HIP):
-        cv2.line(frame_bgr, _px(arr, L_HIP, w, h), _px(arr, R_HIP, w, h), C_BACK, back, cv2.LINE_AA)
+    # back: shoulders, pelvis, and the central spine block
     mid_sh = mid_hip = None
     if ok(L_SH) and ok(R_SH):
+        _bone(frame_bgr, P(L_SH), P(R_SH), C_BACK, hw_back)
         mid_sh = _mid(arr, L_SH, R_SH, w, h)
     if ok(L_HIP) and ok(R_HIP):
+        _bone(frame_bgr, P(L_HIP), P(R_HIP), C_BACK, hw_back)
         mid_hip = _mid(arr, L_HIP, R_HIP, w, h)
     if mid_sh and mid_hip:
-        cv2.line(frame_bgr, mid_sh, mid_hip, C_BACK, back + 1, cv2.LINE_AA)
+        _bone(frame_bgr, mid_sh, mid_hip, C_BACK, hw_back)
 
     # legs + feet (priority - thick amber)
     for a, b in LEG_BONES:
         if ok(a) and ok(b):
-            cv2.line(frame_bgr, _px(arr, a, w, h), _px(arr, b, w, h), C_LEG, leg, cv2.LINE_AA)
+            _bone(frame_bgr, P(a), P(b), C_LEG, hw_leg)
 
-    # head: a dedicated marker + neck line (nose, else ear-midpoint)
+    # head: a dedicated marker + neck block (nose, else ear-midpoint)
     head_pt = None
     if ok(NOSE):
-        head_pt = _px(arr, NOSE, w, h)
+        head_pt = P(NOSE)
     elif ok(L_EAR) and ok(R_EAR):
         head_pt = _mid(arr, L_EAR, R_EAR, w, h)
     if head_pt:
         if mid_sh:
-            cv2.line(frame_bgr, head_pt, mid_sh, C_HEAD, head, cv2.LINE_AA)
-        cv2.circle(frame_bgr, head_pt, 9, C_HEAD, 2, cv2.LINE_AA)
-        cv2.circle(frame_bgr, head_pt, 3, C_HEAD, -1, cv2.LINE_AA)
+            _bone(frame_bgr, head_pt, mid_sh, C_HEAD, hw_head)
+        cv2.circle(frame_bgr, head_pt, int(hw_head * 2.2), C_HEAD, max(2, int(sc * 2)), cv2.LINE_AA)
 
-    # joints
-    for i in JOINTS:
+    # knees + ankles: a contrasting dot for a precise reference point
+    for i in EMPH_JOINTS:
         if ok(i):
-            r = 6 if i in EMPH_JOINTS else 4
-            cv2.circle(frame_bgr, _px(arr, i, w, h), r, C_JOINT, -1, cv2.LINE_AA)
+            cv2.circle(frame_bgr, P(i), max(2, int(sc * 3)), C_JOINT, -1, cv2.LINE_AA)
     return frame_bgr
 
 
