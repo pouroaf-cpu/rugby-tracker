@@ -85,7 +85,7 @@ class RefineWorker(QtCore.QThread):
 
     def __init__(self, jobs, parent=None):
         super().__init__(parent)
-        self.jobs = jobs                 # list of (path, PoseTrack)
+        self.jobs = jobs                 # list of (path, PoseTrack, start_idx)
         self._abort = False
 
     def stop(self):
@@ -94,19 +94,27 @@ class RefineWorker(QtCore.QThread):
     def run(self):
         from rt2.pose import PoseOverlay
         try:
-            total = max(1, sum(t.n for _, t in self.jobs))
+            total = max(1, sum(t.n for _, t, _ in self.jobs))
             done = 0
-            for path, track in self.jobs:
+            for path, track, start in self.jobs:
                 reader = VideoReader(path)
                 # VIDEO mode = temporal tracking (steadier through movement). A fresh
                 # estimator per clip so the tracker state resets between clips.
+                # Note: rotating the start point means timestamps aren't globally
+                # monotonic, so reset the estimator at the wrap to stay legal.
                 pose = PoseOverlay(mode="video")
                 last_ts = -1
                 fps = reader.fps or 30.0
+                start = max(0, min(int(start), track.n - 1))
                 try:
-                    for i in range(track.n):
+                    for k in range(track.n):
                         if self._abort:
                             return
+                        i = (start + k) % track.n
+                        if i == 0 and k != 0:        # wrapped past the end - reset tracker
+                            pose.close()
+                            pose = PoseOverlay(mode="video")
+                            last_ts = -1
                         if not track.has(i):
                             fr = reader.frame(i + 1)
                             if fr is None:
@@ -438,8 +446,13 @@ class TrainingWidget(QtWidgets.QWidget):
 
     # -- refine -------------------------------------------------------------
     def _start_refine(self) -> bool:
-        jobs = [(self.paths[s], self.tracks[s])
-                for s in (A, B) if self.paths[s] and self.tracks[s]]
+        jobs = []
+        for s in (A, B):
+            if self.paths[s] and self.tracks[s] and self.readers[s]:
+                r = self.readers[s]
+                t = self.master_t if s == A else (self.master_t + self.offset)
+                start = max(0, min(int(round(t * r.fps)), r.n_frames - 1))
+                jobs.append((self.paths[s], self.tracks[s], start))
         if not jobs:
             return False
         self._refine = RefineWorker(jobs, self)
@@ -469,7 +482,7 @@ class TrainingWidget(QtWidgets.QWidget):
     def _on_refine_progress(self, pct):
         self.lbl_sync.setText(f"Refining… {pct}%  (skeleton sharpens as it fills)")
         if not self.timer.isActive():     # keep the current frame updating as cache grows
-            self._render()
+            self._render(live=False)      # read cache only - don't compete on the UI thread
 
     def _on_refine_done(self):
         self.btn_refine.setText("Refine (sharpen over time)")
@@ -529,7 +542,7 @@ class TrainingWidget(QtWidgets.QWidget):
                 self.master_t = t1
                 self.timer.stop()
                 self.btn_play.setText("▶ Play")
-        self._render()
+        self._render(live=False)      # never run inference on the UI thread mid-playback
 
     def _on_scrub(self, val):
         t0, t1 = self._overlap()
@@ -537,7 +550,15 @@ class TrainingWidget(QtWidgets.QWidget):
         self._render()
 
     # -- rendering ----------------------------------------------------------
-    def _frame_for(self, slot, t_on_a):
+    def _frame_for(self, slot, t_on_a, live=True):
+        """Build the annotated frame for a slot at master time t_on_a.
+
+        `live` controls whether an UNCACHED frame may run pose inference HERE on
+        the calling (UI) thread. It is True for one-off scrubs/pauses (a single
+        cheap hit) but MUST be False during continuous playback - otherwise every
+        timer tick blocks the event loop on a ~100ms model call and the window
+        freezes. During playback we draw from the cache (which the background
+        Refine pass keeps filling) and carry the last good pose over gaps."""
         reader = self.readers[slot]
         if reader is None:
             return None
@@ -551,12 +572,12 @@ class TrainingWidget(QtWidgets.QWidget):
         if self.show_skel:
             track = self.tracks[slot]
             arr = track.smoothed_at(idx0) if track is not None else None
-            if not _good(arr) and self._pose is not None:
-                live = self._pose.landmarks_array(frame)
-                if track is not None and live is not None:
-                    track.set(idx0, live)
-                if _good(live):
-                    arr = live
+            if live and not _good(arr) and self._pose is not None:
+                got = self._pose.landmarks_array(frame)
+                if track is not None and got is not None:
+                    track.set(idx0, got)
+                if _good(got):
+                    arr = got
             # carry the last good pose over a brief dropout so it doesn't flicker
             if _good(arr):
                 self._last[slot] = (idx0, arr)
@@ -567,10 +588,10 @@ class TrainingWidget(QtWidgets.QWidget):
             frame = draw_skeleton(frame, arr)
         return frame
 
-    def _render(self):
+    def _render(self, live=True):
         _t = time.perf_counter()
         for slot, view in ((A, self.view_a), (B, self.view_b)):
-            frame = self._frame_for(slot, self.master_t)
+            frame = self._frame_for(slot, self.master_t, live=live)
             if frame is None:
                 if self.readers[slot] is None:
                     view.setText(f"Clip {slot}\n(load a video)")
